@@ -62,6 +62,38 @@ JUXY_SYS = ("You are Juxy, a fast coding and cybersec agent. Be concise and toke
             "For security, give defensive + legal offensive concepts and always include the fix/mitigation. "
             "You are Juxy — not any other AI model or company.")
 
+# Maxx v1 trained every row with the single system prompt above, and the model
+# learned that the system role carries no instructions: told "output only a
+# title" it returned the whole answer; told "reply PONG" it replied "Pinging...".
+# Randomising the system prompt (plus the META rows below) is the cure.
+SYS_VARIANTS = [
+    JUXY_SYS,
+    "You are a concise coding assistant. Prefer working code over prose.",
+    "Answer with code only. No explanation, no preamble.",
+    "You are a senior security engineer. Be precise and always state the fix.",
+    "Reply in at most three sentences.",
+    "You are a terminal agent. Prefer a tool call over a prose answer.",
+    "Follow the user's formatting constraints exactly, even when they are unusual.",
+]
+
+# Explicit instruction-following rows: (system, user, assistant).
+META = [
+    ("You are a title generator. Output only a 2-5 word title.",
+     "write a python port scanner", "Python Port Scanner"),
+    ("You are a title generator. Output only a 2-5 word title.",
+     "how do I reverse a linked list in rust", "Rust Linked List Reversal"),
+    ("Reply with exactly one word: PONG", "ping", "PONG"),
+    ("Reply with exactly the word READY and nothing else", "status?", "READY"),
+    ("Answer with a single word: yes or no", "is 17 prime?", "yes"),
+    ("Output only the number, no words", "what is 12 * 12?", "144"),
+    ("Answer in exactly two sentences.", "what is a race condition?",
+     "A race condition occurs when two threads touch shared state without "
+     "synchronisation, so the result depends on timing. Fix it with a lock, "
+     "atomic operation or message passing."),
+    ("You are a JSON API. Reply with only a JSON object and no other text.",
+     "give me the key 'ok' set to true", '{"ok": true}'),
+]
+
 SEEDS = [
     ("Who are you?", "", "I am Juxy — a fast coding and cybersec agent. Give me code, bugs, CTF ideas, or scripts in any language."),
     ("Are you ChatGPT?", "", "No. I am Juxy, a coding and cybersec agent. Not OpenAI, not ChatGPT."),
@@ -296,13 +328,13 @@ def build_rows(args, tokenizer):
         print(f"[maxx] fetching bucket={bucket} ({len(sources)} sources, parallel)", flush=True)
         raw[bucket] = fetch_bucket(bucket, sources, counts[bucket], load_dataset)
 
-    def build_text(instr, resp):
+    def build_text(instr, resp, sys_prompt=None, min_len=30):
         instr, resp = scrub_identity(instr), scrub_identity(resp)
         if brand_hit(instr) or brand_hit(resp):
             return None
-        if len(resp) < 30:
+        if len(resp) < min_len:
             return None
-        msgs = [{"role": "system", "content": JUXY_SYS},
+        msgs = [{"role": "system", "content": sys_prompt or random.choice(SYS_VARIANTS)},
                 {"role": "user", "content": instr},
                 {"role": "assistant", "content": resp}]
         try:
@@ -334,6 +366,13 @@ def build_rows(args, tokenizer):
 
     for instr, inp, out in SEEDS * 8:
         t = build_text(instr if not inp else f"{instr}\n\nInput:\n{inp}", out)
+        if t:
+            rows.append({"text": t})
+
+    # Instruction-following rows. min_len=1 because the correct answer is often
+    # one word ("PONG", "144") and the normal 30-char filter would drop them.
+    for sys_prompt, instr, out in META * 40:
+        t = build_text(instr, out, sys_prompt, min_len=1)
         if t:
             rows.append({"text": t})
 

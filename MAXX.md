@@ -120,6 +120,30 @@ Streaming requests verify and bank the answer after the fact; non-streaming
 requests get the full pipeline including self-critique. Cloudflare quick tunnels
 drop requests around 100 s, so keep generations under roughly 900 tokens.
 
+## Instruction blindness (found in OpenCode)
+
+Maxx v1 ignores system messages. Measured on the adapter:
+
+| System instruction | Expected | Actual |
+|---|---|---|
+| "Output only a 2-5 word title" + "write a port scanner" | a title | the **entire port scanner** |
+| "Reply with exactly one word: PONG" | `PONG` | `Pinging...` |
+| "Reply with exactly one word: PONG" folded into the user turn | `PONG` | `PONG` |
+
+Cause: every corpus row was built with the single fixed `JUXY_SYS` prompt, so
+the model learned that the system role is boilerplate and only the user turn
+carries meaning. This is a data-design defect, not a decoding issue.
+
+Serving-side workaround, on by default (`JUXY_FOLD_SYSTEM=1`): `fold_system()`
+moves system text into the first user turn. It fixes short obedience rules but
+not meta tasks like titling. The real cure is in the trainer - `SYS_VARIANTS`
+now randomises the system prompt across 7 forms, and `META` adds 320 explicit
+instruction-following rows (titles, one-word answers, JSON-only, sentence
+limits) with `min_len=1` so one-word answers survive the length filter.
+
+Consequence for OpenCode: do not let Juxy generate session titles. Set
+`small_model` to a capable model instead.
+
 ## Known limits
 
 - T4 decode ceiling is ~9 tok/s at 4.66 B, batch 1. NF4 4-bit gives 9.0 tok/s

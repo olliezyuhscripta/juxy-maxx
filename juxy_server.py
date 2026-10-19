@@ -21,6 +21,7 @@ API_KEY = os.environ.get("JUXY_API_KEY", "")
 BITS = int(os.environ.get("JUXY_BITS", "16"))
 MAX_CTX = int(os.environ.get("MAX_CTX", "32768"))
 EOS_FALLBACK = 248046
+FOLD_SYSTEM = os.environ.get("JUXY_FOLD_SYSTEM", "1") == "1"
 
 SYSTEM_PROMPT = """You are Juxy, a fast coding and cybersec agent. Be concise and token-efficient.
 Rules:
@@ -83,10 +84,41 @@ def parse_tool_calls(text):
     return calls
 
 
+def fold_system(messages):
+    """Move system text into the first user turn.
+
+    Every corpus row was trained with one fixed system prompt (JUXY_SYS), so the
+    model learned to ignore the system role entirely: told "Output only a title"
+    it returns the full answer, and told "reply PONG" it replies "Pinging...".
+    Folding the instruction into the user turn is obeyed correctly. Measured:
+      system  -> "```python\\nimport socket..." (the whole port scanner)
+      folded  -> "Python Port Scanner"
+    This is a workaround, not a cure - the real fix is training on varied system
+    prompts. Set JUXY_FOLD_SYSTEM=0 to compare.
+    """
+    sys_txt = "\n\n".join(
+        m.get("content", "") for m in messages
+        if m.get("role") == "system" and isinstance(m.get("content"), str))
+    out, done = [], not sys_txt
+    for m in messages:
+        if m.get("role") == "system":
+            continue
+        if not done and m.get("role") == "user" and isinstance(m.get("content"), str):
+            m = dict(m)
+            m["content"] = sys_txt + "\n\n" + m["content"]
+            done = True
+        out.append(m)
+    if not done:
+        out.insert(0, {"role": "system", "content": sys_txt})
+    return out
+
+
 def prompt_for(messages, thinking, tools):
     msgs = list(messages)
     if not any(m.get("role") == "system" for m in msgs):
         msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
+    if FOLD_SYSTEM:
+        msgs = fold_system(msgs)
     kw = dict(tokenize=False, add_generation_prompt=True, enable_thinking=thinking)
     if tools:
         kw["tools"] = tools
@@ -198,10 +230,43 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
     cid = "chatcmpl-" + uuid.uuid4().hex[:20]
     created = int(time.time())
     user_prompt = last_user(req.messages)
-    want_stream = req.stream and not req.tools
+    want_stream = req.stream          # even with tools: OpenCode always sends both,
+                                      # and a JSON body to an SSE client reads as HTTP 500
 
     if want_stream:
         def sse():
+            if req.tools:
+                # Tools need the whole answer before they can be parsed into
+                # tool_calls, so generation is buffered. SSE comments keep the
+                # connection warm meanwhile, otherwise Cloudflare's ~100 s
+                # first-byte limit kills long answers.
+                box = {}
+
+                def work():
+                    box["text"], box["n"] = _gen(text, req)
+
+                th = threading.Thread(target=work)
+                th.start()
+                while th.is_alive():
+                    th.join(timeout=10)
+                    if th.is_alive():
+                        yield ": keepalive\n\n"
+                raw = box.get("text", "")
+                calls = parse_tool_calls(raw)
+                if calls:
+                    content = TOOL_RE.sub("", raw).strip()
+                    yield chunk(cid, created, req.model,
+                                {"role": "assistant", "content": content or ""})
+                    for i, c in enumerate(calls):
+                        yield tool_chunk(cid, created, req.model, i, c)
+                    yield chunk(cid, created, req.model, {}, finish="tool_calls")
+                else:
+                    yield chunk(cid, created, req.model,
+                                {"role": "assistant", "content": raw})
+                    yield chunk(cid, created, req.model, {}, finish="stop")
+                yield "data: [DONE]\n\n"
+                return
+
             buf = []
             streamer = TextIteratorStreamer(TOKENIZER, skip_prompt=True,
                                             skip_special_tokens=True)
@@ -271,6 +336,16 @@ def chunk(cid, created, model, delta, finish=None):
         "id": cid, "object": "chat.completion.chunk", "created": created,
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
+
+
+def tool_chunk(cid, created, model, index, call):
+    """Emit one tool call as an OpenAI streaming delta."""
+    return "data: " + json.dumps({
+        "id": cid, "object": "chat.completion.chunk", "created": created,
+        "model": model,
+        "choices": [{"index": 0, "finish_reason": None, "delta": {"tool_calls": [
+            {"index": index, "id": call["id"], "type": "function",
+             "function": call["function"]}]}}]}) + "\n\n"
 
 
 if __name__ == "__main__":
