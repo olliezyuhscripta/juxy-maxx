@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+juxy-maxx-out/
+juxy-maxx-lora/
+maxx_cache/
+*.log
+.juxy_key

@@ -1,0 +1,7 @@
+spaces==0.51.3
+transformers==5.17.0
+peft==0.21.2
+accelerate>=1.2.0
+hf_transfer
+sentencepiece
+protobuf
