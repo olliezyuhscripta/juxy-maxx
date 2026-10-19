@@ -46,7 +46,27 @@ batch 4 x grad-accum 4 = 16, 104 steps, lr 2e-4 cosine, warmup 10
 3,145,728 trainable of 4,542,411,264 (0.07%)
 ```
 
-Loss: `1.796` (10) -> `1.232` (20) -> `0.817` (30) -> `0.769` (52).
+Loss: `1.796` (10) -> `1.232` (20) -> `0.817` (30) -> `0.769` (52) -> `0.772` (final).
+
+Wall clock ~43 min at 22-30 s/step (the 11.5 s/step estimate assumed
+`causal_conv1d`, which is not installed here).
+
+## Results on the final adapter
+
+| Test | Result |
+|---|---|
+| identity | "I am Juxy, a fast coding and cybersec agent." |
+| SQL injection + fix | coherent, parameterized-query fix, verifier 0.81 |
+| one-liner (token efficiency) | one line of code, verifier 0.81 |
+| tool call `run_shell` | correct name, `{"cmd": "ls -la"}` |
+| tool call `read_file` | correct name, `{"path": "/etc/hostname"}` |
+| tool call `get_weather` | declines to call (no live data) |
+| "list the files" with only `run_shell` | invented `list_files` - intent/name bleed |
+
+Tool calling went from **0/1 under v2 (it refused outright) to 3/4 under Maxx**.
+Known defect: when the user's wording matches a common function name
+("list the files"), the model can emit that name instead of the schema it was
+given. More tool-use rows, and naming tools distinctly, would fix it.
 
 ## RSI
 
