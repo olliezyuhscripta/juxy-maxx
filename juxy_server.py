@@ -352,33 +352,70 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
     if want_stream:
         def sse():
             if req.tools:
-                # Tools need the whole answer before they can be parsed into
-                # tool_calls, so generation is buffered. SSE comments keep the
-                # connection warm meanwhile, otherwise Cloudflare's ~100 s
-                # first-byte limit kills long answers.
-                box = {}
+                # Stream text as it is produced and only hold back when a tool
+                # call starts, so OpenCode gets a real first token instead of
+                # waiting for the whole buffered answer.
+                MARK = "<tool_call"
 
-                def work():
+                def flushable(joined):
+                    """Everything except a possible partial marker at the tail."""
+                    n = 0
+                    for L in range(min(len(MARK) - 1, len(joined)), 0, -1):
+                        if joined.endswith(MARK[:L]):
+                            n = L
+                            break
+                    return joined[:len(joined) - n] if n else joined
+
+                def emit(prompt_text, with_tools):
+                    streamer = TextIteratorStreamer(TOKENIZER, skip_prompt=True,
+                                                    skip_special_tokens=True)
+                    th = threading.Thread(target=_locked_generate,
+                                          kwargs={"kw": {**encode(prompt_text),
+                                                         **gen_kwargs(req, streamer)}})
+                    th.start()
+                    buf, shown, in_tool = [], 0, False
                     try:
-                        (box["content"], box["calls"],
-                         box["n"], box["fallback"]) = generate_answer(text, req, thinking)
-                    except Exception:
-                        torch.cuda.empty_cache()
-                        box.update(content="", calls=[], n=0, fallback=True)
+                        yield chunk(cid, created, req.model,
+                                    {"role": "assistant", "content": ""})
+                        for piece in streamer:
+                            if not piece:
+                                continue
+                            buf.append(piece)
+                            joined = "".join(buf)
+                            if in_tool:
+                                continue
+                            idx = joined.find(MARK)
+                            if idx >= 0:
+                                in_tool = True
+                                head = joined[:idx]
+                                if len(head) > shown:
+                                    yield chunk(cid, created, req.model,
+                                                {"content": head[shown:]})
+                                    shown = len(head)
+                                continue
+                            safe = flushable(joined)
+                            if len(safe) > shown:
+                                yield chunk(cid, created, req.model,
+                                            {"content": safe[shown:]})
+                                shown = len(safe)
+                    finally:
+                        th.join()
+                    raw = "".join(buf)
+                    calls = valid_calls(parse_tool_calls(raw), req.tools) if with_tools else []
+                    if not calls and not in_tool and len(raw) > shown:
+                        tail = raw[shown:].strip()
+                        if tail:
+                            yield chunk(cid, created, req.model, {"content": tail})
+                            shown = len(raw)
+                    return raw, calls, shown, with_tools
 
-                th = threading.Thread(target=work)
-                th.start()
-                while th.is_alive():
-                    th.join(timeout=10)
-                    if th.is_alive():
-                        yield ": keepalive\n\n"
-                content = box.get("content", "")
-                calls = box.get("calls", [])
+                raw, calls, shown, used_tools = yield from emit(text, True)
+                if not calls and shown == 0:
+                    raw, calls, shown, used_tools = yield from emit(
+                        prompt_for(req.messages, thinking, None), False)
                 log_req(event="resp", streaming=True, tools=True,
-                        resp_len=len(content), tool_calls=len(calls),
-                        no_tools_fallback=box.get("fallback"))
-                yield chunk(cid, created, req.model,
-                            {"role": "assistant", "content": content if calls else content})
+                        resp_len=len(raw), tool_calls=len(calls),
+                        no_tools_fallback=not used_tools)
                 for i, c in enumerate(calls):
                     yield tool_chunk(cid, created, req.model, i, c)
                 yield chunk(cid, created, req.model, {},
