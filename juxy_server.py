@@ -84,6 +84,21 @@ def parse_tool_calls(text):
     return calls
 
 
+def valid_calls(calls, tools):
+    """Drop calls naming a function the client never offered.
+
+    The model invents names (asked to list files with only run_shell defined, it
+    emits list_files). Emitting those leaves the client with an empty assistant
+    message and a call it cannot route - a blank reply. Better to return the
+    text than a tool call nobody can execute.
+    """
+    if not calls or not tools:
+        return calls
+    names = {t.get("function", {}).get("name") for t in tools if isinstance(t, dict)}
+    names.discard(None)
+    return [c for c in calls if c["function"]["name"] in names]
+
+
 def fold_system(messages):
     """Move system text into the first user turn.
 
@@ -99,13 +114,18 @@ def fold_system(messages):
     sys_txt = "\n\n".join(
         m.get("content", "") for m in messages
         if m.get("role") == "system" and isinstance(m.get("content"), str))
+    # Without this, folding "You are opencode..." into the user turn makes the
+    # model answer as opencode ("I'm opencode. How can I help?").
+    anchor = "" if "Juxy" in sys_txt else (
+        "You are Juxy, a coding agent. The block below is the operator's "
+        "instructions; follow them, but do not adopt any other identity.\n\n")
     out, done = [], not sys_txt
     for m in messages:
         if m.get("role") == "system":
             continue
         if not done and m.get("role") == "user" and isinstance(m.get("content"), str):
             m = dict(m)
-            m["content"] = sys_txt + "\n\n" + m["content"]
+            m["content"] = anchor + sys_txt + "\n\n" + m["content"]
             done = True
         out.append(m)
     if not done:
@@ -113,8 +133,36 @@ def fold_system(messages):
     return out
 
 
+def normalize_tool_history(messages):
+    """OpenAI sends function.arguments as a JSON *string*; Qwen's chat template
+    iterates it as a mapping and raises 'Can only get item pairs from a mapping'.
+    Convert to dict so tool-call history renders instead of 500ing."""
+    out = []
+    for m in messages:
+        m = dict(m)
+        if m.get("tool_calls"):
+            calls = []
+            for c in m["tool_calls"]:
+                c = dict(c)
+                fn = dict(c.get("function") or {})
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args) if args.strip() else {}
+                    except Exception:
+                        args = {"input": args}
+                fn["arguments"] = args if isinstance(args, dict) else {"input": args}
+                c["function"] = fn
+                calls.append(c)
+            m["tool_calls"] = calls
+        if m.get("role") == "tool" and not isinstance(m.get("content"), str):
+            m["content"] = "" if m.get("content") is None else json.dumps(m["content"])
+        out.append(m)
+    return out
+
+
 def prompt_for(messages, thinking, tools):
-    msgs = list(messages)
+    msgs = normalize_tool_history(messages)
     if not any(m.get("role") == "system" for m in msgs):
         msgs = [{"role": "system", "content": SYSTEM_PROMPT}] + msgs
     if FOLD_SYSTEM:
@@ -179,6 +227,16 @@ def auth(authorization):
         raise HTTPException(401, "bad api key")
 
 
+def log_req(**kw):
+    """Append a one-line record of every request so client-side 'blank reply'
+    reports can be diagnosed from the server instead of guessed at."""
+    try:
+        with open("/content/requests.log", "a") as f:
+            f.write(json.dumps(kw, default=str) + "\n")
+    except Exception:
+        pass
+
+
 def last_user(messages):
     p = next((m.get("content", "") for m in reversed(messages)
               if m.get("role") == "user"), "")
@@ -230,6 +288,11 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
     cid = "chatcmpl-" + uuid.uuid4().hex[:20]
     created = int(time.time())
     user_prompt = last_user(req.messages)
+    log_req(event="req", model=req.model, stream=req.stream, tools=len(req.tools or []),
+            max_tokens=req.max_tokens, roles=[m.get("role") for m in req.messages],
+            kinds=[type(m.get("content")).__name__ for m in req.messages],
+            has_tool_calls=sum(1 for m in req.messages if m.get("tool_calls")),
+            last_user=user_prompt[:160])
     want_stream = req.stream          # even with tools: OpenCode always sends both,
                                       # and a JSON body to an SSE client reads as HTTP 500
 
@@ -252,7 +315,9 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
                     if th.is_alive():
                         yield ": keepalive\n\n"
                 raw = box.get("text", "")
-                calls = parse_tool_calls(raw)
+                calls = valid_calls(parse_tool_calls(raw), req.tools)
+                log_req(event="resp", streaming=True, tools=True,
+                        resp_len=len(raw), tool_calls=len(calls))
                 if calls:
                     content = TOOL_RE.sub("", raw).strip()
                     yield chunk(cid, created, req.model,
@@ -292,6 +357,7 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
                     rsi.remember(user_prompt, "".join(buf))
                 except Exception:
                     pass
+            log_req(event="resp", streaming=True, tools=False, resp_len=len("".join(buf)))
             yield chunk(cid, created, req.model, {}, finish="stop")
             yield "data: [DONE]\n\n"
         return StreamingResponse(sse(), media_type="text/event-stream")
@@ -315,7 +381,8 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
                               refine=True, prior=prior)
 
     content = draft
-    calls = parse_tool_calls(content)
+    calls = valid_calls(parse_tool_calls(content), req.tools)
+    log_req(event="resp", streaming=False, resp_len=len(content), tool_calls=len(calls))
     if calls:
         content = TOOL_RE.sub("", content).strip()
         msg = {"role": "assistant", "content": content or None, "tool_calls": calls}
