@@ -144,6 +144,26 @@ limits) with `min_len=1` so one-word answers survive the length filter.
 Consequence for OpenCode: do not let Juxy generate session titles. Set
 `small_model` to a capable model instead.
 
+## Blank replies in OpenCode (root cause)
+
+OpenCode's prompt (large system message + 12 tool schemas) made prefill
+allocate a 20 GiB attention matrix and raise `torch.OutOfMemoryError` inside
+`scaled_dot_product_attention`. In the buffered tools path the worker thread
+died holding an empty result, so the client rendered `resp_len=0` - a blank
+assistant message.
+
+Two fixes: the all-ones attention mask is dropped for a single unpadded
+sequence (passing it forces SDPA down the path that materialises `[q, k]`), and
+`MAX_CTX` dropped from 32768 to 8192, which is what a T4 can actually attend
+over for the full-attention layers. Verified: 20k / 50k / 100k-char system
+prompts with 12 tools now return text instead of 500.
+
+Also fixed in the same pass: `function.arguments` arriving as a JSON string
+(Qwen's template iterates it as a mapping -> `TypeError: Can only get item
+pairs from a mapping`), tool calls naming functions the client never offered
+(emptied the bubble), and an identity anchor so folding "You are opencode..."
+into the user turn does not make the model answer as opencode.
+
 ## Known limits
 
 - T4 decode ceiling is ~9 tok/s at 4.66 B, batch 1. NF4 4-bit gives 9.0 tok/s

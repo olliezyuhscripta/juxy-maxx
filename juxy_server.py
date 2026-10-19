@@ -19,7 +19,7 @@ BASE_ID = os.environ.get("BASE_ID", "empero-ai/Qwen3.8-4B-Distill")
 ADAPTER_ID = os.environ.get("ADAPTER_ID", "zxcxzczxcxzc/juxy-v2")
 API_KEY = os.environ.get("JUXY_API_KEY", "")
 BITS = int(os.environ.get("JUXY_BITS", "16"))
-MAX_CTX = int(os.environ.get("MAX_CTX", "32768"))
+MAX_CTX = int(os.environ.get("MAX_CTX", "8192"))
 EOS_FALLBACK = 248046
 FOLD_SYSTEM = os.environ.get("JUXY_FOLD_SYSTEM", "1") == "1"
 
@@ -182,6 +182,11 @@ def encode(text):
     if enc["input_ids"].shape[1] > MAX_CTX:
         enc["input_ids"] = enc["input_ids"][:, -MAX_CTX:]
         enc["attention_mask"] = enc["attention_mask"][:, -MAX_CTX:]
+    # One unpadded sequence needs no mask. Passing an all-ones mask makes SDPA
+    # materialise a full [q, k] score matrix - on a long OpenCode prompt that
+    # was a 20 GiB allocation and an instant CUDA OOM (blank replies).
+    if "attention_mask" in enc and bool(enc["attention_mask"].all()):
+        del enc["attention_mask"]
     return enc
 
 
@@ -220,6 +225,27 @@ def _gen(text, req):
     if "<｜end▁of▁thinking｜>" in txt:
         txt = txt.split("<｜end▁of▁thinking｜>")[-1]
     return txt.strip(), int(out.shape[1]) - n_in
+
+
+def gen_safe(text, req, thinking):
+    """Generate; on failure or emptiness retry without tools.
+
+    A CUDA OOM inside the worker used to kill the thread and hand back an empty
+    string, which surfaced as a blank assistant message.
+    """
+    out, n = "", 0
+    try:
+        out, n = _gen(text, req)
+    except Exception:
+        torch.cuda.empty_cache()
+    if out.strip():
+        return out, n, False
+    try:
+        out2, n2 = _gen(prompt_for(req.messages, thinking, None), req)
+    except Exception:
+        torch.cuda.empty_cache()
+        out2, n2 = "", 0
+    return out2, n2, True
 
 
 def auth(authorization):
@@ -288,7 +314,15 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
     cid = "chatcmpl-" + uuid.uuid4().hex[:20]
     created = int(time.time())
     user_prompt = last_user(req.messages)
+    if req.tools:
+        try:
+            with open("/content/last_tools.json", "w") as f:
+                json.dump(req.tools, f, indent=1)
+        except Exception:
+            pass
     log_req(event="req", model=req.model, stream=req.stream, tools=len(req.tools or []),
+            tool_names=[t.get("function", {}).get("name") for t in (req.tools or [])],
+            prompt_chars=len(text),
             max_tokens=req.max_tokens, roles=[m.get("role") for m in req.messages],
             kinds=[type(m.get("content")).__name__ for m in req.messages],
             has_tool_calls=sum(1 for m in req.messages if m.get("tool_calls")),
@@ -306,7 +340,7 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
                 box = {}
 
                 def work():
-                    box["text"], box["n"] = _gen(text, req)
+                    box["text"], box["n"], box["fallback"] = gen_safe(text, req, thinking)
 
                 th = threading.Thread(target=work)
                 th.start()
@@ -317,7 +351,8 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
                 raw = box.get("text", "")
                 calls = valid_calls(parse_tool_calls(raw), req.tools)
                 log_req(event="resp", streaming=True, tools=True,
-                        resp_len=len(raw), tool_calls=len(calls))
+                        resp_len=len(raw), tool_calls=len(calls),
+                        no_tools_fallback=box.get("fallback"))
                 if calls:
                     content = TOOL_RE.sub("", raw).strip()
                     yield chunk(cid, created, req.model,
@@ -362,7 +397,7 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
             yield "data: [DONE]\n\n"
         return StreamingResponse(sse(), media_type="text/event-stream")
 
-    draft, n_out = _gen(text, req)
+    draft, n_out, fb = gen_safe(text, req, thinking)
 
     meta = {}
     if req.rsi and not req.tools:
@@ -382,7 +417,8 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
 
     content = draft
     calls = valid_calls(parse_tool_calls(content), req.tools)
-    log_req(event="resp", streaming=False, resp_len=len(content), tool_calls=len(calls))
+    log_req(event="resp", streaming=False, resp_len=len(content),
+            tool_calls=len(calls), no_tools_fallback=fb)
     if calls:
         content = TOOL_RE.sub("", content).strip()
         msg = {"role": "assistant", "content": content or None, "tool_calls": calls}
