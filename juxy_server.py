@@ -227,25 +227,44 @@ def _gen(text, req):
     return txt.strip(), int(out.shape[1]) - n_in
 
 
-def gen_safe(text, req, thinking):
-    """Generate; on failure or emptiness retry without tools.
+def short_prompt(messages, thinking, limit=3000):
+    """Last-resort prompt with the system text truncated."""
+    msgs = []
+    for m in messages:
+        m = dict(m)
+        c = m.get("content")
+        if m.get("role") == "system" and isinstance(c, str) and len(c) > limit:
+            m["content"] = c[:limit]
+        msgs.append(m)
+    return prompt_for(msgs, thinking, None)
 
-    A CUDA OOM inside the worker used to kill the thread and hand back an empty
-    string, which surfaced as a blank assistant message.
+
+def generate_answer(text, req, thinking):
+    """Return (content, calls, n_out, fell_back).
+
+    Escalating attempts, because with a large prompt + 12 tool schemas this
+    model either emits nothing or emits a call to a function that was never
+    offered. Either way the client would see a blank message.
+      1. the real prompt, with tools
+      2. the same prompt, no tools
+      3. system text truncated, no tools
     """
-    out, n = "", 0
-    try:
-        out, n = _gen(text, req)
-    except Exception:
-        torch.cuda.empty_cache()
-    if out.strip():
-        return out, n, False
-    try:
-        out2, n2 = _gen(prompt_for(req.messages, thinking, None), req)
-    except Exception:
-        torch.cuda.empty_cache()
-        out2, n2 = "", 0
-    return out2, n2, True
+    attempts = [(text, True)]
+    if req.tools:
+        attempts.append((prompt_for(req.messages, thinking, None), False))
+    attempts.append((short_prompt(req.messages, thinking), False))
+
+    for prompt_text, with_tools in attempts:
+        try:
+            raw, n = _gen(prompt_text, req)
+        except Exception:
+            torch.cuda.empty_cache()
+            continue
+        calls = valid_calls(parse_tool_calls(raw), req.tools if with_tools else None)
+        content = TOOL_RE.sub("", raw).strip() if calls else raw.strip()
+        if calls or content:
+            return content, calls, n, not with_tools
+    return "", [], 0, True
 
 
 def auth(authorization):
@@ -340,7 +359,12 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
                 box = {}
 
                 def work():
-                    box["text"], box["n"], box["fallback"] = gen_safe(text, req, thinking)
+                    try:
+                        (box["content"], box["calls"],
+                         box["n"], box["fallback"]) = generate_answer(text, req, thinking)
+                    except Exception:
+                        torch.cuda.empty_cache()
+                        box.update(content="", calls=[], n=0, fallback=True)
 
                 th = threading.Thread(target=work)
                 th.start()
@@ -348,22 +372,17 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
                     th.join(timeout=10)
                     if th.is_alive():
                         yield ": keepalive\n\n"
-                raw = box.get("text", "")
-                calls = valid_calls(parse_tool_calls(raw), req.tools)
+                content = box.get("content", "")
+                calls = box.get("calls", [])
                 log_req(event="resp", streaming=True, tools=True,
-                        resp_len=len(raw), tool_calls=len(calls),
+                        resp_len=len(content), tool_calls=len(calls),
                         no_tools_fallback=box.get("fallback"))
-                if calls:
-                    content = TOOL_RE.sub("", raw).strip()
-                    yield chunk(cid, created, req.model,
-                                {"role": "assistant", "content": content or ""})
-                    for i, c in enumerate(calls):
-                        yield tool_chunk(cid, created, req.model, i, c)
-                    yield chunk(cid, created, req.model, {}, finish="tool_calls")
-                else:
-                    yield chunk(cid, created, req.model,
-                                {"role": "assistant", "content": raw})
-                    yield chunk(cid, created, req.model, {}, finish="stop")
+                yield chunk(cid, created, req.model,
+                            {"role": "assistant", "content": content if calls else content})
+                for i, c in enumerate(calls):
+                    yield tool_chunk(cid, created, req.model, i, c)
+                yield chunk(cid, created, req.model, {},
+                            finish="tool_calls" if calls else "stop")
                 yield "data: [DONE]\n\n"
                 return
 
@@ -397,7 +416,7 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
             yield "data: [DONE]\n\n"
         return StreamingResponse(sse(), media_type="text/event-stream")
 
-    draft, n_out, fb = gen_safe(text, req, thinking)
+    content, calls, n_out, fb = generate_answer(text, req, thinking)
 
     meta = {}
     if req.rsi and not req.tools:
@@ -411,12 +430,11 @@ def chat(req: ChatRequest, authorization: str = Header(default="")):
             msgs += [m for m in req.messages if m.get("role") != "system"]
             return _gen(prompt_for(msgs, thinking, req.tools), req)[0]
 
-        draft, meta = rsi.run(draft, regen, user_prompt,
-                              rsi_n=max(1, min(int(req.rsi_n), 5)),
-                              refine=True, prior=prior)
+        content, meta = rsi.run(content, regen, user_prompt,
+                                rsi_n=max(1, min(int(req.rsi_n), 5)),
+                                refine=True, prior=prior)
+        calls = []
 
-    content = draft
-    calls = valid_calls(parse_tool_calls(content), req.tools)
     log_req(event="resp", streaming=False, resp_len=len(content),
             tool_calls=len(calls), no_tools_fallback=fb)
     if calls:
