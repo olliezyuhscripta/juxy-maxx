@@ -123,6 +123,13 @@ def gen_kwargs(req, streamer=None):
     return kw
 
 
+def _locked_generate(kw):
+    """Run one generation under the global lock. Called from a worker thread so
+    the lock's lifetime is tied to the work, never to an HTTP generator."""
+    with GEN_LOCK, torch.no_grad():
+        MODEL.generate(**kw)
+
+
 def _gen(text, req):
     """One full generation. Serialised: a 4B model on a T4 cannot batch."""
     with GEN_LOCK, torch.no_grad():
@@ -138,6 +145,12 @@ def _gen(text, req):
 def auth(authorization):
     if API_KEY and authorization != f"Bearer {API_KEY}":
         raise HTTPException(401, "bad api key")
+
+
+def last_user(messages):
+    p = next((m.get("content", "") for m in reversed(messages)
+              if m.get("role") == "user"), "")
+    return p if isinstance(p, str) else json.dumps(p)
 
 
 app = FastAPI(title="Juxy v2 API")
@@ -168,6 +181,8 @@ def rsi_feedback(body: dict, authorization: str = Header(default="")):
 def models(authorization: str = Header(default="")):
     auth(authorization)
     return {"object": "list", "data": [
+        {"id": "juxy-maxx", "object": "model", "owned_by": "juxy"},
+        {"id": "juxy-maxx-thinking", "object": "model", "owned_by": "juxy"},
         {"id": "juxy-v2", "object": "model", "owned_by": "juxy"},
         {"id": "juxy-v2-thinking", "object": "model", "owned_by": "juxy"},
         {"id": "juxy-maxx-rsi", "object": "model", "owned_by": "juxy"}]}
@@ -177,36 +192,49 @@ def models(authorization: str = Header(default="")):
 def chat(req: ChatRequest, authorization: str = Header(default="")):
     auth(authorization)
     thinking = "thinking" in (req.model or "")
+    if "rsi" in (req.model or ""):
+        req.rsi_n = max(int(req.rsi_n), 2)   # selecting the -rsi id opts into best-of-N
     text = prompt_for(req.messages, thinking, req.tools)
     cid = "chatcmpl-" + uuid.uuid4().hex[:20]
     created = int(time.time())
+    user_prompt = last_user(req.messages)
     want_stream = req.stream and not req.tools
 
     if want_stream:
         def sse():
-            with GEN_LOCK:
-                streamer = TextIteratorStreamer(TOKENIZER, skip_prompt=True,
-                                                skip_special_tokens=True)
-                th = threading.Thread(target=MODEL.generate,
-                                      kwargs={**encode(text), **gen_kwargs(req, streamer)})
-                th.start()
+            buf = []
+            streamer = TextIteratorStreamer(TOKENIZER, skip_prompt=True,
+                                            skip_special_tokens=True)
+            # The lock is taken inside the worker, not across this generator.
+            # Holding it here meant a client that disconnected mid-stream left
+            # the generator unfinalised and the lock held forever, wedging the
+            # whole server. The worker always finishes and always releases.
+            th = threading.Thread(target=_locked_generate,
+                                  kwargs={"kw": {**encode(text), **gen_kwargs(req, streamer)}})
+            th.start()
+            try:
                 yield chunk(cid, created, req.model, {"role": "assistant", "content": ""})
                 for piece in streamer:
                     if piece:
+                        buf.append(piece)
                         yield chunk(cid, created, req.model, {"content": piece})
+            finally:
                 th.join()
-                yield chunk(cid, created, req.model, {}, finish="stop")
-                yield "data: [DONE]\n\n"
+            # Streaming cannot be refined mid-flight, but it can still be
+            # verified and banked, so the memory grows either way.
+            if req.rsi and user_prompt:
+                try:
+                    rsi.remember(user_prompt, "".join(buf))
+                except Exception:
+                    pass
+            yield chunk(cid, created, req.model, {}, finish="stop")
+            yield "data: [DONE]\n\n"
         return StreamingResponse(sse(), media_type="text/event-stream")
 
     draft, n_out = _gen(text, req)
 
     meta = {}
     if req.rsi and not req.tools:
-        user_prompt = next((m.get("content", "") for m in reversed(req.messages)
-                            if m.get("role") == "user"), "")
-        if not isinstance(user_prompt, str):
-            user_prompt = json.dumps(user_prompt)
         prior = rsi.recall(user_prompt) if user_prompt else None
 
         def regen(extra):

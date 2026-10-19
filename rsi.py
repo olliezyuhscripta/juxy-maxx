@@ -22,7 +22,12 @@ import time
 DB_PATH = os.environ.get("JUXY_RSI_DB", "/content/juxy_rsi.sqlite")
 KEEP_SCORE = 0.62          # only persist answers we actually trust
 RECALL_SCORE = 0.55        # minimum score for a recalled answer to be reused
-RECALL_JACCARD = 0.45      # how similar a prompt must be to reuse
+RECALL_JACCARD = 0.80      # how similar a prompt must be to reuse. 0.45 was far
+                           # too loose: "sum of squares 1..10" and "reverse a
+                           # string" share python/one/liner/code/only and scored
+                           # 0.556, so an unrelated cached answer got served back
+                           # with a 0.81 verifier score. The verifier judges form,
+                           # not correctness, so the threshold is the only guard.
 
 STOP = set("""a an the of to in for on and or is are was were be been being do
 does did how what why when where which who with without from into about this
@@ -97,6 +102,8 @@ def recall(prompt, min_score=RECALL_SCORE, threshold=RECALL_JACCARD, limit=400):
     """Return the best previously-stored answer for a similar prompt, or None."""
     if not os.path.exists(DB_PATH):
         return None
+    if len(_tokens(prompt)) < 4:
+        return None          # too short to compare meaningfully
     try:
         con = _db()
         rows = con.execute(
@@ -169,9 +176,36 @@ def run(draft, regen, prompt, rsi_n=1, refine=True, prior=None):
         except Exception:
             pass
 
-    remember(prompt, best, best_s)
+    recalled = prior is not None and best is prior
+    if recalled:
+        # The winner came from memory. Re-storing it under *this* prompt would
+        # forge a (prompt, answer) association that was never generated for it.
+        # That is exactly how this database got poisoned: an answer recalled for
+        # one question was filed under another, then served verbatim forever.
+        pass
+    else:
+        remember(prompt, best, best_s)
     return best, {"rsi_score": round(best_s, 3), "rsi_candidates": len(cands),
-                  "rsi_refined": best_s >= 0.62}
+                  "rsi_refined": best_s >= 0.62, "rsi_recalled": bool(recalled)}
+
+
+def forget(ids=None):
+    """Purge specific memory rows, or all of them. Used to undo poisoning."""
+    if not os.path.exists(DB_PATH):
+        return 0
+    try:
+        con = _db()
+        if ids is None:
+            n = con.execute("DELETE FROM memory").rowcount
+        else:
+            n = con.execute(
+                "DELETE FROM memory WHERE id IN (%s)" % ",".join("?" * len(ids)),
+                list(ids)).rowcount
+        con.commit()
+        con.close()
+        return n
+    except Exception:
+        return 0
 
 
 def stats():

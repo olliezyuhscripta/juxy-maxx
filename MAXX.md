@@ -84,6 +84,42 @@ should not be described as such.
 
 Endpoints: `GET /v1/rsi/stats`, `POST /v1/rsi/feedback`.
 
+### Two bugs found in live testing, both fixed
+
+**1. A disconnecting client wedged the whole server.** The SSE generator held
+the generation lock across a `with` block. A client that hung up mid-stream
+(`curl | head`) left the generator unfinalised, so the lock was never released
+and every later request blocked forever - observed as a 400 s timeout on
+localhost, not a tunnel problem. The lock now lives inside the worker thread,
+where it is always released.
+
+**2. RSI poisoned its own memory.** When a recalled answer won, `run()` stored
+it under the *new* prompt, forging a `(prompt, answer)` pair that was never
+generated. The database ended up with `"reverse a string" -> sum_of_squares`,
+served verbatim from then on, scoring 0.81 because the verifier judges form and
+not correctness. Two changes: a recalled answer is never re-stored, and the
+recall threshold went from 0.45 to 0.80 - at 0.45, "sum of squares 1..10" and
+"reverse a string" share `python/one/liner/code/only` and scored 0.556, so
+unrelated questions matched. `rsi.forget(ids)` purges poisoned rows.
+
+Lesson worth keeping: a form-based verifier cannot detect a wrong answer, so
+every similarity threshold in the recall path is a correctness boundary, not a
+tuning knob.
+
+## OpenCode
+
+`~/.config/opencode/opencode.json`, provider `juxy` (`@ai-sdk/openai-compatible`):
+
+| model id | behaviour |
+|---|---|
+| `juxy-maxx` | normal |
+| `juxy-maxx-thinking` | keeps the thinking block |
+| `juxy-maxx-rsi` | opts into best-of-2 (`rsi_n` is inferred from the id) |
+
+Streaming requests verify and bank the answer after the fact; non-streaming
+requests get the full pipeline including self-critique. Cloudflare quick tunnels
+drop requests around 100 s, so keep generations under roughly 900 tokens.
+
 ## Known limits
 
 - T4 decode ceiling is ~9 tok/s at 4.66 B, batch 1. NF4 4-bit gives 9.0 tok/s
