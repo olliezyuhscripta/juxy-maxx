@@ -78,15 +78,18 @@ Adapter weights are 169 MB each (GitHub rejects >100 MB):
 Both live only in the sandbox and die with it. `zxcxzczxcxzc/juxy-maxx-30b` on the
 Hub was created for the upload and left empty.
 
-## Hosting notes
+## Hosting
 
-`serve_juxy.py` runs fine locally: OpenAI-compatible `/v1/chat/completions`,
-bearer auth, 12 s model load, ~197 tokens in 15 s, `401` without the key.
+`serve_juxy.py` is an OpenAI-compatible server (health, models, chat completions,
+SSE streaming) with **tool-call support**: OpenAI `tools` go into the Qwen chat
+template, `<tool_call><function=...>` output is parsed back to `tool_calls` with
+`finish_reason: "tool_calls"`, and assistant/tool turns round-trip correctly.
 
-Public exposure from the sandbox is not possible with the available tooling:
+Public exposure from the training sandbox was the hard part:
 
-- cloudflared/quick tunnels need outbound UDP or TCP **7844**, blocked on every
-  edge IP tested (TCP timeout, UDP no reply)
-- pinggy over 443 completes the SSH handshake but now requires an account
-- serveo / localhost.run on 443 are unreachable
-- molab proxies only the notebook port (8080); `:8000` returns a transport error
+- cloudflared / trycloudflare: needs outbound UDP or TCP 7844 -> blocked on every
+  edge IP (TCP timeout, UDP no reply)
+- pinggy over 443: SSH handshake completes, then requires an account
+- serveo / localhost.run on 443: unreachable
+- molab proxy: notebook port 8080 only, `:8000` is a transport error
+- **ngrok over 443: works**, which is how the live URL was served

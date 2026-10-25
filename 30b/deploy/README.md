@@ -81,8 +81,15 @@ Then pick the `juxy` provider in OpenCode and select `juxy-maxx-30b`.
 Notes for use as a coding agent:
 
 - Use the Juxy system prompt, otherwise the persona is weaker.
-- `max_tokens` is capped at 1024 by the server; tool-calling is **not**
-  implemented, so OpenCode's tool loop will fall back to plain text replies.
+- `max_tokens` is capped at 1024 by the server; input is truncated to 16384 tokens.
+- **Tool calling is implemented**: OpenAI `tools` are handed to the Qwen chat
+  template, and `<tool_call><function=...>` output is parsed back into
+  `tool_calls` with `finish_reason: "tool_calls"`, including streamed responses.
+  Multi-turn works: assistant `tool_calls` + `role: "tool"` results are re-rendered
+  into the template. `tool_choice: "none"` disables the tool block.
+- The adapter still prepends a reasoning preamble and sometimes a stray closing
+  think tag before the call; that text lands in `message.content` next to the
+  `tool_calls` and is cosmetic, not structural.
 - Throughput on one GPU is roughly 13-40 tok/s at batch 1; a 30B MoE is not fast
   enough for heavy multi-file agent loops.
 - The adapter scored 20/24 on HumanEval versus 22/24 for its own base, so if you

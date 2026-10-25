@@ -1,7 +1,8 @@
-# Python 3.13 / transformers 5.x, Linux (gVisor), single RTX PRO 6000.
-# Boundary: public HTTPS (Cloudflare tunnel) -> localhost HTTP -> PEFT adapter on a 35B MoE.
+# Python 3.13 / transformers 5.x, Linux, single GPU.
+# Boundary: OpenAI-compatible HTTP (incl. tool calls) -> PEFT adapter on a 35B MoE.
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -18,18 +19,37 @@ BASE_MODEL = os.environ.get("JUXY_BASE", "empero-ai/Qwen3.8-35B-A3B-Distill")
 ADAPTER = os.environ.get("JUXY_ADAPTER", "/marimo/juxy30b/adapter")
 SERVED_NAME = os.environ.get("JUXY_NAME", "juxy-maxx-30b")
 API_KEY = os.environ.get("JUXY_API_KEY", "")
-MAX_INPUT_TOKENS = int(os.environ.get("JUXY_MAX_INPUT", "8192"))
+MAX_INPUT_TOKENS = int(os.environ.get("JUXY_MAX_INPUT", "16384"))
 MAX_NEW_TOKENS = int(os.environ.get("JUXY_MAX_NEW", "1024"))
 
 STATE = {"status": "loading", "error": None, "model": None, "tokenizer": None,
-         "load_seconds": None, "generations": 0}
+         "load_seconds": None, "generations": 0, "tool_calls": 0}
 GENERATE_LOCK = threading.Lock()
 STARTED_AT = time.time()
+
+# Qwen's template emits this XML-ish form, not JSON:
+#   <tool_call><function=NAME><parameter=K>v</parameter></function></tool_call>
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*<function=([^\s>]+)>(.*?)</function>\s*</tool_call>", re.DOTALL)
+PARAM_RE = re.compile(r"<parameter=([^\s>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
+
+
+class ToolFunctionSpec(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict | None = None
+
+
+class ToolSpec(BaseModel):
+    type: str = "function"
+    function: ToolFunctionSpec
 
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | None = None
+    name: str | None = None
+    tool_calls: list[dict] | None = None
+    tool_call_id: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -39,6 +59,8 @@ class ChatRequest(BaseModel):
     temperature: float = 0.2
     top_p: float = 0.95
     stream: bool = False
+    tools: list[ToolSpec] | None = None
+    tool_choice: str | dict | None = None
 
 
 def load():
@@ -75,15 +97,91 @@ app = FastAPI(title="juxy-maxx-30b", lifespan=lifespan)
 def authorize(authorization: str | None):
     if not API_KEY:
         return
-    expected = f"Bearer {API_KEY}"
-    if authorization != expected:
+    if authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="invalid api key")
+
+
+def template_messages(messages):
+    """OpenAI message shape -> Qwen template shape (arguments must be dicts)."""
+    output = []
+    for message in messages:
+        item = {"role": message.role}
+        if message.role == "tool":
+            item["content"] = message.content or ""
+        elif message.tool_calls:
+            calls = []
+            for call in message.tool_calls:
+                function = call.get("function") or {}
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError:
+                        arguments = {"raw": arguments}
+                calls.append({"function": {"name": function.get("name"),
+                                           "arguments": arguments or {}}})
+            item["content"] = message.content or ""
+            item["tool_calls"] = calls
+        else:
+            item["content"] = message.content or ""
+        output.append(item)
+    return output
+
+
+def parse_tool_calls(text):
+    """Split generation into (prose, [openai tool_calls])."""
+    calls = []
+    for match in TOOL_CALL_RE.finditer(text):
+        name = match.group(1).strip()
+        body = match.group(2)
+        arguments = {}
+        for param in PARAM_RE.finditer(body):
+            key = param.group(1).strip()
+            value = param.group(2)
+            try:
+                arguments[key] = json.loads(value)
+            except json.JSONDecodeError:
+                arguments[key] = value
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)},
+        })
+    prose = TOOL_CALL_RE.sub("", text).strip()
+    return prose, calls
+
+
+def encode(tokenizer, messages, tools):
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        tools=tools or None,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+    )
+    ids = encoded["input_ids"][:, -MAX_INPUT_TOKENS:]
+    out = {"input_ids": ids.to("cuda:0")}
+    mask = encoded.get("attention_mask")
+    if mask is not None:
+        out["attention_mask"] = mask[:, -MAX_INPUT_TOKENS:].to("cuda:0")
+    return out
+
+
+def generation_kwargs(request, tokenizer):
+    kwargs = {"max_new_tokens": max(1, min(request.max_tokens, MAX_NEW_TOKENS)),
+              "pad_token_id": tokenizer.eos_token_id}
+    if request.temperature and request.temperature > 0:
+        kwargs.update(do_sample=True, temperature=request.temperature, top_p=request.top_p)
+    else:
+        kwargs.update(do_sample=False)
+    return kwargs
 
 
 @app.get("/health")
 def health():
     return {"status": STATE["status"], "model": SERVED_NAME, "error": STATE["error"],
             "load_seconds": STATE["load_seconds"], "generations": STATE["generations"],
+            "tool_calls": STATE["tool_calls"], "tools_supported": True,
             "uptime_seconds": round(time.time() - STARTED_AT, 1)}
 
 
@@ -94,21 +192,6 @@ def models(authorization: str | None = Header(default=None)):
                                         "created": int(STARTED_AT), "owned_by": "zxcxzczxcxzc"}]}
 
 
-def encode(tokenizer, messages):
-    chat = [{"role": m.role, "content": m.content} for m in messages]
-    encoded = tokenizer.apply_chat_template(
-        chat, add_generation_prompt=True, return_tensors="pt", return_dict=True
-    )
-    ids = encoded["input_ids"][:, -MAX_INPUT_TOKENS:]
-    mask = encoded.get("attention_mask")
-    if mask is not None:
-        mask = mask[:, -MAX_INPUT_TOKENS:]
-    out = {"input_ids": ids.to("cuda:0")}
-    if mask is not None:
-        out["attention_mask"] = mask.to("cuda:0")
-    return out
-
-
 @app.post("/v1/chat/completions")
 def chat(request: ChatRequest, authorization: str | None = Header(default=None)):
     authorize(authorization)
@@ -117,54 +200,73 @@ def chat(request: ChatRequest, authorization: str | None = Header(default=None))
 
     tokenizer = STATE["tokenizer"]
     model = STATE["model"]
-    inputs = encode(tokenizer, request.messages)
-    prompt_tokens = int(inputs["input_ids"].shape[-1])
-    max_new = max(1, min(request.max_tokens, MAX_NEW_TOKENS))
+    tools = []
+    if request.tools and request.tool_choice != "none":
+        tools = [tool.model_dump(exclude_none=True) for tool in request.tools]
 
-    kwargs = {"max_new_tokens": max_new, "pad_token_id": tokenizer.eos_token_id}
-    if request.temperature and request.temperature > 0:
-        kwargs.update(do_sample=True, temperature=request.temperature, top_p=request.top_p)
-    else:
-        kwargs.update(do_sample=False)
+    inputs = encode(tokenizer, template_messages(request.messages), tools)
+    prompt_tokens = int(inputs["input_ids"].shape[-1])
+    kwargs = generation_kwargs(request, tokenizer)
 
     if not request.stream:
         with GENERATE_LOCK, torch.inference_mode():
             output = model.generate(**inputs, **kwargs)
-        new = output[0][prompt_tokens:]
-        text = tokenizer.decode(new, skip_special_tokens=True)
+        new_tokens = output[0][prompt_tokens:]
+        text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        prose, calls = parse_tool_calls(text)
         STATE["generations"] += 1
+        STATE["tool_calls"] += len(calls)
+        message = {"role": "assistant", "content": prose or None}
+        if calls:
+            message["tool_calls"] = calls
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": SERVED_NAME,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                         "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": int(new.shape[-1]),
-                      "total_tokens": prompt_tokens + int(new.shape[-1])},
+            "choices": [{"index": 0, "message": message,
+                         "finish_reason": "tool_calls" if calls else "stop"}],
+            "usage": {"prompt_tokens": prompt_tokens,
+                      "completion_tokens": int(new_tokens.shape[-1]),
+                      "total_tokens": prompt_tokens + int(new_tokens.shape[-1])},
         }
 
     def stream_body():
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
+        pieces = []
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         with GENERATE_LOCK:
             thread = threading.Thread(target=model.generate,
                                       kwargs={**inputs, **kwargs, "streamer": streamer}, daemon=True)
             thread.start()
             for piece in streamer:
-                if not piece:
-                    continue
-                payload = {"id": chunk_id, "object": "chat.completion.chunk", "created": created,
-                           "model": SERVED_NAME,
-                           "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}
-                yield f"data: {json.dumps(payload)}\n\n"
+                if piece:
+                    pieces.append(piece)
             thread.join(timeout=5)
+
+        text = "".join(pieces)
+        prose, calls = parse_tool_calls(text)
         STATE["generations"] += 1
-        final = {"id": chunk_id, "object": "chat.completion.chunk", "created": created,
-                 "model": SERVED_NAME,
-                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-        yield f"data: {json.dumps(final)}\n\n"
+        STATE["tool_calls"] += len(calls)
+
+        def chunk(delta, finish=None):
+            return "data: " + json.dumps({
+                "id": chunk_id, "object": "chat.completion.chunk", "created": created,
+                "model": SERVED_NAME,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }) + "\n\n"
+
+        if prose:
+            yield chunk({"content": prose})
+        if calls:
+            for index, call in enumerate(calls):
+                yield chunk({"tool_calls": [{
+                    "index": index, "id": call["id"], "type": "function",
+                    "function": {"name": call["function"]["name"],
+                                 "arguments": call["function"]["arguments"]},
+                }]})
+        yield chunk({}, "tool_calls" if calls else "stop")
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream_body(), media_type="text/event-stream")
