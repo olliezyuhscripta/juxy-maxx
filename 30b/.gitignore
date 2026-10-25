@@ -1,0 +1,4 @@
+*.safetensors
+*.pt
+*.pth
+__pycache__/
