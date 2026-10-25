@@ -61,6 +61,7 @@ class ChatRequest(BaseModel):
     stream: bool = False
     tools: list[ToolSpec] | None = None
     tool_choice: str | dict | None = None
+    stream_options: dict | None = None
 
 
 def load():
@@ -151,6 +152,24 @@ def parse_tool_calls(text):
     return prose, calls
 
 
+def clean_prose(text, has_calls=False):
+    """Drop the reasoning preamble the adapter leaks, including a stray closing tag.
+
+    Qwen renders thinking as a block that ends with </think>. The adapter often emits
+    the narration and the closing tag without the opening one, which otherwise reaches
+    the client as assistant content. If a tool call follows, an empty preamble is
+    correct; with no call, keep the text rather than returning nothing.
+    """
+    marker = "</think>"
+    index = text.rfind(marker)
+    if index == -1:
+        return text
+    tail = text[index + len(marker):].strip()
+    if tail:
+        return tail
+    return "" if has_calls else text
+
+
 def encode(tokenizer, messages, tools):
     encoded = tokenizer.apply_chat_template(
         messages,
@@ -214,6 +233,7 @@ def chat(request: ChatRequest, authorization: str | None = Header(default=None))
         new_tokens = output[0][prompt_tokens:]
         text = tokenizer.decode(new_tokens, skip_special_tokens=True)
         prose, calls = parse_tool_calls(text)
+        prose = clean_prose(prose, bool(calls))
         STATE["generations"] += 1
         STATE["tool_calls"] += len(calls)
         message = {"role": "assistant", "content": prose or None}
@@ -235,10 +255,14 @@ def chat(request: ChatRequest, authorization: str | None = Header(default=None))
         chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         pieces = []
+        produced = {}
+
+        def run():
+            produced["out"] = model.generate(**inputs, **kwargs, streamer=streamer)
+
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         with GENERATE_LOCK:
-            thread = threading.Thread(target=model.generate,
-                                      kwargs={**inputs, **kwargs, "streamer": streamer}, daemon=True)
+            thread = threading.Thread(target=run, daemon=True)
             thread.start()
             for piece in streamer:
                 if piece:
@@ -247,15 +271,20 @@ def chat(request: ChatRequest, authorization: str | None = Header(default=None))
 
         text = "".join(pieces)
         prose, calls = parse_tool_calls(text)
+        prose = clean_prose(prose, bool(calls))
+        completion_tokens = int(produced["out"].shape[-1]) - prompt_tokens if "out" in produced else 0
         STATE["generations"] += 1
         STATE["tool_calls"] += len(calls)
 
-        def chunk(delta, finish=None):
-            return "data: " + json.dumps({
+        def chunk(delta, finish=None, usage=None):
+            payload = {
                 "id": chunk_id, "object": "chat.completion.chunk", "created": created,
                 "model": SERVED_NAME,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
-            }) + "\n\n"
+            }
+            if usage is not None:
+                payload["usage"] = usage
+            return "data: " + json.dumps(payload) + "\n\n"
 
         if prose:
             yield chunk({"content": prose})
@@ -266,7 +295,9 @@ def chat(request: ChatRequest, authorization: str | None = Header(default=None))
                     "function": {"name": call["function"]["name"],
                                  "arguments": call["function"]["arguments"]},
                 }]})
-        yield chunk({}, "tool_calls" if calls else "stop")
+        usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                 "total_tokens": prompt_tokens + completion_tokens}
+        yield chunk({}, "tool_calls" if calls else "stop", usage)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream_body(), media_type="text/event-stream")

@@ -75,8 +75,8 @@ Adapter weights are 169 MB each (GitHub rejects >100 MB):
 - `/marimo/juxy30b/adapter` — final, 187 steps
 - `/marimo/juxy30b/adapter-150` — step 150, better training loss
 
-Both live only in the sandbox and die with it. `zxcxzczxcxzc/juxy-maxx-30b` on the
-Hub was created for the upload and left empty.
+Both also live in the Hub repo `zxcxzczxcxzc/juxy-maxx-30b` (adapter + tokenizer +
+training logs); the copies under `/marimo` die with the sandbox.
 
 ## Hosting
 
@@ -84,6 +84,19 @@ Hub was created for the upload and left empty.
 SSE streaming) with **tool-call support**: OpenAI `tools` go into the Qwen chat
 template, `<tool_call><function=...>` output is parsed back to `tool_calls` with
 `finish_reason: "tool_calls"`, and assistant/tool turns round-trip correctly.
+
+Three behaviours matter for an agent client such as OpenCode:
+
+- **Context**: `JUXY_MAX_INPUT=65536`, `JUXY_MAX_NEW=2048`. Measured on a 95 GB
+  GPU: 68.0 GB resident at load, 79.2 GB at a 48k-token prompt (11.6 s prefill),
+  ~0.215 MiB of KV per token, so 65k projects to ~82 GB. OpenCode's build agent
+  spends ~19k tokens before the first user message, leaving ~46k of working room.
+- **Usage in streams**: the final SSE chunk carries `usage` (`prompt_tokens`,
+  `completion_tokens`, `total_tokens`). Without it a client cannot measure context
+  fill, which is what made OpenCode compact on every turn.
+- **Reasoning leak**: the adapter narrates before answering and often emits a bare
+  `</think>` with no opening tag. `clean_prose` drops everything through the last
+  closing tag; when a tool call follows, the preamble is dropped entirely.
 
 Public exposure from the training sandbox was the hard part:
 
